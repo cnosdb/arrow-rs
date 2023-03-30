@@ -27,12 +27,12 @@ repository = "https://github.com/apache/arrow-rs"
 license = "Apache-2.0"
 
 [dependencies]
-arrow-array = { version = "32.0.0", path = "../arrow-array" }
-arrow-buffer = { version = "32.0.0", path = "../arrow-buffer" }
+arrow-array = { version = "32.0.0" }
+arrow-buffer = { version = "32.0.0" }
 # Cast is needed to work around https://github.com/apache/arrow-rs/issues/3389
-arrow-cast = { version = "32.0.0", path = "../arrow-cast" }
-arrow-ipc = { version = "32.0.0", path = "../arrow-ipc" }
-arrow-schema = { version = "32.0.0", path = "../arrow-schema" }
+arrow-cast = { version = "32.0.0" }
+arrow-ipc = { version = "32.0.0" }
+arrow-schema = { version = "32.0.0" }
 base64 = { version = "0.21", default-features = false, features = ["std"] }
 tonic = { version = "0.8", default-features = false, features = ["transport", "codegen", "prost"] }
 bytes = { version = "1", default-features = false }

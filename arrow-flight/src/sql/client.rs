@@ -20,6 +20,7 @@ use base64::Engine;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::Duration;
+use tonic::metadata::MetadataMap;
 
 use crate::flight_service_client::FlightServiceClient;
 use crate::sql::server::{CLOSE_PREPARED_STATEMENT, CREATE_PREPARED_STATEMENT};
@@ -34,7 +35,7 @@ use crate::sql::{
 };
 use crate::{
     Action, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, IpcMessage, Ticket,
+    HandshakeResponse, IpcMessage, PutResult, Ticket,
 };
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
@@ -42,7 +43,7 @@ use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::read_record_batch;
 use arrow_ipc::{root_as_message, MessageHeader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-use futures::{stream, TryStreamExt};
+use futures::{stream, Stream, TryStreamExt};
 use prost::Message;
 #[cfg(feature = "tls")]
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
@@ -54,6 +55,8 @@ use tonic::Streaming;
 #[derive(Debug, Clone)]
 pub struct FlightSqlServiceClient {
     token: Option<String>,
+    /// Optional grpc header metadata to include with each request
+    metadata: MetadataMap,
     flight_client: FlightServiceClient<Channel>,
 }
 
@@ -122,8 +125,38 @@ impl FlightSqlServiceClient {
         let flight_client = FlightServiceClient::new(channel);
         FlightSqlServiceClient {
             token: None,
+            metadata: MetadataMap::new(),
             flight_client,
         }
+    }
+
+    /// Return a reference to gRPC metadata included with each request
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.metadata
+    }
+
+    /// Return a reference to gRPC metadata included with each request
+    ///
+    /// These headers can be used, for example, to include
+    /// authorization or other application specific headers.
+    pub fn metadata_mut(&mut self) -> &mut MetadataMap {
+        &mut self.metadata
+    }
+
+    /// Add the specified header with value to all subsequent
+    /// requests. See [`Self::metadata_mut`] for fine grained control.
+    pub fn add_header(&mut self, key: &str, value: &str) -> Result<(), ArrowError> {
+        let key = tonic::metadata::MetadataKey::<_>::from_bytes(key.as_bytes())
+            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
+        let value = value
+            .parse()
+            .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+
+        // ignore previous value
+        self.metadata.insert(key, value);
+
+        Ok(())
     }
 
     /// Return a reference to the underlying [`FlightServiceClient`]
@@ -141,18 +174,28 @@ impl FlightSqlServiceClient {
         self.flight_client
     }
 
+    async fn get_flight_info(
+        &mut self,
+        descriptor: FlightDescriptor,
+    ) -> Result<FlightInfo, ArrowError> {
+        let request = self.make_request(descriptor);
+
+        let response = self
+            .flight_client
+            .get_flight_info(request)
+            .await
+            .map_err(status_to_arrow_error)?
+            .into_inner();
+        Ok(response)
+    }
+
     async fn get_flight_info_for_command<M: ProstMessageExt>(
         &mut self,
         cmd: M,
     ) -> Result<FlightInfo, ArrowError> {
         let descriptor = FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec());
-        let fi = self
-            .flight_client
-            .get_flight_info(descriptor)
-            .await
-            .map_err(status_to_arrow_error)?
-            .into_inner();
-        Ok(fi)
+
+        self.get_flight_info(descriptor).await
     }
 
     /// Execute a query on the server.
@@ -172,7 +215,8 @@ impl FlightSqlServiceClient {
             protocol_version: 0,
             payload: Default::default(),
         };
-        let mut req = tonic::Request::new(stream::iter(vec![cmd]));
+        // let mut req = tonic::Request::new(stream::iter(vec![cmd]));
+        let mut req = self.make_request(stream::iter(vec![cmd]));
         let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
         let val = format!("Basic {val}")
             .parse()
@@ -208,19 +252,32 @@ impl FlightSqlServiceClient {
         Ok(resp.payload.clone())
     }
 
+    async fn do_put<S: Stream<Item = FlightData> + Send + 'static>(
+        &mut self,
+        request: S,
+    ) -> Result<Streaming<PutResult>, ArrowError> {
+        let request = self.make_request(request);
+
+        let response = self
+            .flight_client
+            .do_put(request)
+            .await
+            .map_err(status_to_arrow_error)?
+            .into_inner();
+
+        Ok(response)
+    }
+
     /// Execute a update query on the server, and return the number of records affected
     pub async fn execute_update(&mut self, query: String) -> Result<i64, ArrowError> {
         let cmd = CommandStatementUpdate { query };
         let descriptor = FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec());
         let mut result = self
-            .flight_client
             .do_put(stream::iter(vec![FlightData {
                 flight_descriptor: Some(descriptor),
                 ..Default::default()
             }]))
-            .await
-            .map_err(status_to_arrow_error)?
-            .into_inner();
+            .await?;
         let result = result
             .message()
             .await
@@ -251,9 +308,11 @@ impl FlightSqlServiceClient {
         &mut self,
         ticket: Ticket,
     ) -> Result<Streaming<FlightData>, ArrowError> {
+        let request = self.make_request(ticket);
+
         Ok(self
             .flight_client
-            .do_get(ticket)
+            .do_get(request)
             .await
             .map_err(status_to_arrow_error)?
             .into_inner())
@@ -329,7 +388,9 @@ impl FlightSqlServiceClient {
             r#type: CREATE_PREPARED_STATEMENT.to_string(),
             body: cmd.as_any().encode_to_vec().into(),
         };
-        let mut req = tonic::Request::new(action);
+        // let mut req = tonic::Request::new(action);
+        let mut req = self.make_request(action);
+
         if let Some(token) = &self.token {
             let val = format!("Bearer {token}").parse().map_err(|_| {
                 ArrowError::IoError("Statement already closed.".to_string())
@@ -368,6 +429,14 @@ impl FlightSqlServiceClient {
     /// Explicitly shut down and clean up the client.
     pub async fn close(&mut self) -> Result<(), ArrowError> {
         Ok(())
+    }
+
+    /// return a Request, adding any configured metadata
+    fn make_request<T>(&self, t: T) -> tonic::Request<T> {
+        // Pass along metadata
+        let mut request = tonic::Request::new(t);
+        *request.metadata_mut() = self.metadata.clone();
+        request
     }
 }
 
@@ -480,7 +549,7 @@ fn decode_error_to_arrow_error(err: prost::DecodeError) -> ArrowError {
     ArrowError::IoError(err.to_string())
 }
 
-fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
+pub fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
     ArrowError::IoError(format!("{status:?}"))
 }
 
